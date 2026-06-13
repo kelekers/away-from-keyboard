@@ -1,17 +1,21 @@
 """
 AFK - Away From Keyboard
-Sprint 0: Setup & Riset Dasar
+Sprint 1: Hand & Eye Tracking Pipeline
 
-Proof of concept:
-- Capture webcam real-time
-- Render landmark wajah (iris) & tangan menggunakan MediaPipe
+Proof of concept (lanjutan Sprint 0):
+- Menggunakan modul HandTracker untuk deteksi tangan + hitung jari terangkat
+- Menggunakan modul FaceTracker untuk hitung diameter iris (estimasi jarak)
+- Smoothing posisi fingertip & diameter iris dengan EMA
 - Toggle aktif/nonaktif program via hotkey Win+A
 """
 
 import cv2
-import mediapipe as mp
-import threading
 from pynput import keyboard
+
+from afk.tracker.hand_tracker import HandTracker
+from afk.tracker.face_tracker import FaceTracker
+from afk.utils.smoothing import EMASmoother
+
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -28,10 +32,6 @@ state = AppState()
 # Hotkey listener: Win+A untuk toggle aktif/nonaktif
 # ---------------------------------------------------------------------------
 def start_hotkey_listener():
-    """
-    Mendengarkan kombinasi tombol Win+A secara global.
-    Saat ditekan, toggle state.active.
-    """
     COMBO = {keyboard.Key.cmd, keyboard.KeyCode.from_char('a')}
     current_keys = set()
 
@@ -54,36 +54,43 @@ def start_hotkey_listener():
 
 
 # ---------------------------------------------------------------------------
-# MediaPipe setup
+# Overlay
 # ---------------------------------------------------------------------------
-mp_face_mesh = mp.solutions.face_mesh
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
-
-# Landmark index untuk iris (refine_landmarks=True diperlukan)
-LEFT_IRIS = [468, 469, 470, 471, 472]
-RIGHT_IRIS = [473, 474, 475, 476, 477]
-
-
-def draw_status_overlay(frame, state: AppState, num_hands: int, face_detected: bool):
-    """Menampilkan indikator status program di pojok kiri atas frame."""
+def draw_status_overlay(frame, state: AppState, finger_status: dict | None,
+                         iris_diameter_px: float | None):
     h, w = frame.shape[:2]
 
     status_text = "AKTIF" if state.active else "NONAKTIF (Win+A untuk toggle)"
     status_color = (0, 255, 0) if state.active else (0, 0, 255)
 
-    cv2.rectangle(frame, (0, 0), (w, 70), (30, 30, 30), -1)
+    cv2.rectangle(frame, (0, 0), (w, 95), (30, 30, 30), -1)
     cv2.putText(frame, f"Status: {status_text}", (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-    cv2.putText(frame, f"Tangan terdeteksi: {num_hands} | Wajah: {'Ya' if face_detected else 'Tidak'}",
-                (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+    if finger_status is not None:
+        finger_text = (
+            f"Jari: telunjuk={int(finger_status['index'])} "
+            f"tengah={int(finger_status['middle'])} "
+            f"jempol={int(finger_status['thumb'])} "
+            f"| total={finger_status['count']}"
+        )
+    else:
+        finger_text = "Tangan: tidak terdeteksi"
+    cv2.putText(frame, finger_text, (10, 55),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+    if iris_diameter_px is not None:
+        iris_text = f"Diameter iris: {iris_diameter_px:.2f} px (proxy jarak mata-kamera)"
+    else:
+        iris_text = "Wajah: tidak terdeteksi"
+    cv2.putText(frame, iris_text, (10, 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
 
 def main():
     print("=" * 60)
     print("AFK - Away From Keyboard")
-    print("Sprint 0: Setup & Riset Dasar (Proof of Concept)")
+    print("Sprint 1: Hand & Eye Tracking Pipeline")
     print("=" * 60)
     print("Tekan Win+A untuk toggle AKTIF/NONAKTIF")
     print("Tekan 'q' pada window video untuk keluar")
@@ -91,75 +98,82 @@ def main():
 
     listener = start_hotkey_listener()
 
+    hand_tracker = HandTracker(max_num_hands=1)
+    face_tracker = FaceTracker()
+
+    # Smoother untuk posisi fingertip (telunjuk) dan diameter iris.
+    # alpha=0.5 dipilih sebagai titik awal: cukup responsif tapi sudah
+    # meredam jitter kecil. Akan di-tuning di Sprint 3.
+    index_tip_smoother = EMASmoother(alpha=0.5)
+    iris_diameter_smoother = EMASmoother(alpha=0.3)
+
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("[Error] Tidak bisa membuka webcam. Cek koneksi kamera/permission.")
         return
 
-    with mp_face_mesh.FaceMesh(
-        max_num_faces=1,
-        refine_landmarks=True,  # diperlukan untuk landmark iris
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    ) as face_mesh, mp_hands.Hands(
-        max_num_hands=1,  # bebas tangan kiri/kanan, hanya 1 tangan
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    ) as hands:
-
+    try:
         while cap.isOpened() and state.running:
             success, frame = cap.read()
             if not success:
                 print("[Warning] Gagal membaca frame dari webcam.")
                 continue
 
-            # Flip horizontal supaya seperti cermin (lebih intuitif untuk user)
             frame = cv2.flip(frame, 1)
+            h, w = frame.shape[:2]
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             rgb_frame.flags.writeable = False
 
-            face_results = face_mesh.process(rgb_frame)
-            hand_results = hands.process(rgb_frame)
+            # --- Hand tracking ---
+            hand_landmarks = hand_tracker.process(rgb_frame)
+            finger_status = None
+            smoothed_index_tip = None
 
-            num_hands = 0
-            face_detected = False
+            if hand_landmarks is not None:
+                finger_status = HandTracker.count_raised_fingers(hand_landmarks)
 
-            # --- Render hand landmarks ---
-            if hand_results.multi_hand_landmarks:
-                num_hands = len(hand_results.multi_hand_landmarks)
-                for hand_landmarks in hand_results.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(
-                        frame,
-                        hand_landmarks,
-                        mp_hands.HAND_CONNECTIONS,
-                        mp_drawing_styles.get_default_hand_landmarks_style(),
-                        mp_drawing_styles.get_default_hand_connections_style(),
-                    )
+                raw_index_tip = HandTracker.get_index_fingertip(hand_landmarks, w, h)
+                smoothed_index_tip = index_tip_smoother.update(raw_index_tip)
 
-            # --- Render face/iris landmarks ---
-            if face_results.multi_face_landmarks:
-                face_detected = True
-                h, w = frame.shape[:2]
-                for face_landmarks in face_results.multi_face_landmarks:
-                    # Gambar titik iris kiri & kanan (untuk estimasi jarak nanti)
-                    for idx in LEFT_IRIS + RIGHT_IRIS:
-                        lm = face_landmarks.landmark[idx]
-                        cx, cy = int(lm.x * w), int(lm.y * h)
-                        cv2.circle(frame, (cx, cy), 2, (255, 0, 255), -1)
+                # Gambar titik fingertip (telunjuk = hijau, tengah = kuning)
+                index_px = (int(smoothed_index_tip[0]), int(smoothed_index_tip[1]))
+                cv2.circle(frame, index_px, 8, (0, 255, 0), -1)
 
-            # --- Overlay status ---
-            draw_status_overlay(frame, state, num_hands, face_detected)
+                middle_px = HandTracker.get_middle_fingertip(hand_landmarks, w, h)
+                cv2.circle(frame, middle_px, 6, (0, 255, 255), -1)
+            else:
+                index_tip_smoother.reset()
 
-            cv2.imshow("AFK - Sprint 0 PoC", frame)
+            # --- Face tracking (iris) ---
+            face_landmarks = face_tracker.process(rgb_frame)
+            smoothed_iris_diameter = None
+
+            if face_landmarks is not None:
+                raw_iris_diameter = face_tracker.iris_diameter_px(face_landmarks, w, h)
+                smoothed_iris_diameter = iris_diameter_smoother.update(raw_iris_diameter)
+
+                # Visualisasi titik iris (kiri & kanan, center saja)
+                for idx in (468, 473):  # center iris kiri & kanan
+                    px = FaceTracker.get_iris_landmark_px(face_landmarks, idx, w, h)
+                    cv2.circle(frame, px, 3, (255, 0, 255), -1)
+            else:
+                iris_diameter_smoother.reset()
+
+            # --- Overlay ---
+            draw_status_overlay(frame, state, finger_status, smoothed_iris_diameter)
+
+            cv2.imshow("AFK - Sprint 1 PoC", frame)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 state.running = False
                 break
-
-    cap.release()
-    cv2.destroyAllWindows()
-    listener.stop()
-    print("[AFK] Program dihentikan.")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        hand_tracker.close()
+        face_tracker.close()
+        listener.stop()
+        print("[AFK] Program dihentikan.")
 
 
 if __name__ == "__main__":
