@@ -63,11 +63,71 @@ afk_project/
 ## Roadmap Sprint
 1. ✅ Setup & Riset Dasar (capture, landmark render, hotkey Win+A)
 2. ✅ Hand & Eye Tracking Pipeline (deteksi jari, estimasi jarak via iris)
-3. Kalibrasi (4 titik ekstrem layar)
+3. ✅ Kalibrasi (4 titik ekstrem layar)
 4. Cursor Control + Dynamic Re-scaling
 5. Gesture Klik (1 jari -> 2 jari naik = klik kiri)
 6. UX & Stabilitas (overlay, pause/resume, error handling)
 7. (Opsional) Gesture tambahan: klik kanan, drag, scroll
+
+## Sprint 2: Kalibrasi
+
+Penambahan dari Sprint 1:
+
+- **`afk/calibration.py`** — modul `CalibrationManager`:
+  - Flow kalibrasi 4 titik berurutan: **TOP -> BOTTOM -> LEFT -> RIGHT**.
+  - Trigger titik: gesture **2 jari** (telunjuk + tengah terangkat, jari
+    lain terlipat) **ditahan diam** selama `CONFIRM_FRAMES_REQUIRED` (15
+    frame, ~0.5 detik @30fps) dalam toleransi `HOLD_TOLERANCE_PX` (25px).
+    Jika tangan bergeser terlalu jauh, hitungan "hold" reset dan mulai
+    lagi dari posisi baru — mencegah kalibrasi ter-trigger oleh gerakan
+    tidak sengaja.
+  - Setelah 4 titik terkonfirmasi, dihitung bounding box ruang kamera
+    (`cam_left`, `cam_right`, `cam_top`, `cam_bottom`) + diameter iris
+    referensi (rata-rata dari 4 titik).
+  - **Disimpan ke `config/calibration.json`** — otomatis di-load saat
+    program start, sehingga user tidak perlu kalibrasi ulang setiap buka
+    program (kecuali tekan `c` untuk re-kalibrasi).
+  - **`map_to_screen()`** — memetakan posisi fingertip (pixel kamera) ke
+    koordinat layar (pixel), dengan **auto re-scaling** berdasarkan rasio
+    `reference_iris_diameter_px / current_iris_diameter_px`: jika user
+    menjauh, area kontrol di ruang kamera membesar (skala dari titik
+    tengah) supaya jangkauan kursor di layar tetap konsisten secara
+    proporsional.
+
+- **`main.py`** — terintegrasi:
+  - Otomatis load kalibrasi tersimpan saat start.
+  - Tekan **`c`** untuk mulai/mengulang kalibrasi kapan saja.
+  - Overlay khusus saat kalibrasi: instruksi per langkah, progress
+    bar "hold to confirm", indikator gesture 2 jari (hijau = valid,
+    merah = belum/invalid).
+  - Setelah dikalibrasi, overlay bawah menampilkan **preview** hasil
+    mapping fingertip -> koordinat layar (belum menggerakkan kursor asli
+    — itu Sprint 3).
+
+### Sudah Diverifikasi (unit test logic, tanpa webcam)
+- Flow kalibrasi penuh (4 titik, 60 frame @15 frame/titik) — OK,
+  menghasilkan bounding box & referensi iris yang benar.
+- Save & load ke/dari `config/calibration.json` — OK.
+- `map_to_screen()`: mapping titik tengah & sudut-sudut bounding box ke
+  layar — OK.
+- Auto re-scaling: simulasi user menjauh (ratio=2) dan mendekat (ratio=0.5)
+  — area kontrol membesar/mengecil sesuai ekspektasi — OK.
+- Edge case "hold tolerance reset" (tangan bergeser di tengah hold) — OK,
+  hitungan reset dan tetap bisa terkonfirmasi setelah stabil kembali.
+
+### Belum diuji (perlu webcam asli di laptopmu)
+- Apakah gesture 2 jari (telunjuk+tengah) nyaman & akurat ditahan diam
+  selama ~0.5 detik untuk tiap titik kalibrasi.
+- Apakah `HOLD_TOLERANCE_PX=25` dan `CONFIRM_FRAMES_REQUIRED=15` terasa pas
+  (terlalu sensitif/tidak), perlu tuning berdasarkan FPS aktual & ukuran
+  resolusi kamera.
+- Akurasi mapping preview di koordinat layar real saat fingertip diarahkan
+  ke 4 sudut layar setelah kalibrasi.
+- Perilaku auto re-scaling saat user benar-benar maju/mundur dari layar.
+
+### Catatan
+- `config/calibration.json` di-gitignore-kan sebaiknya (data personal per
+  user/device) — lihat `.gitignore` yang ditambahkan di sprint ini.
 
 ## Sprint 1: Hand & Eye Tracking Pipeline
 

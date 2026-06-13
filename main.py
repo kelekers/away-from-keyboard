@@ -1,20 +1,34 @@
 """
 AFK - Away From Keyboard
-Sprint 1: Hand & Eye Tracking Pipeline
+Sprint 2: Kalibrasi
 
-Proof of concept (lanjutan Sprint 0):
-- Menggunakan modul HandTracker untuk deteksi tangan + hitung jari terangkat
-- Menggunakan modul FaceTracker untuk hitung diameter iris (estimasi jarak)
-- Smoothing posisi fingertip & diameter iris dengan EMA
-- Toggle aktif/nonaktif program via hotkey Win+A
+Penambahan dari Sprint 1:
+- Integrasi CalibrationManager: flow kalibrasi 4 titik (atas, bawah, kiri,
+  kanan) menggunakan gesture 2 jari (telunjuk + tengah) yang ditahan diam.
+- Load kalibrasi otomatis saat start jika file config sudah ada.
+- Tombol 'c' untuk memulai/mengulang kalibrasi secara manual.
+- Setelah kalibrasi selesai, overlay menampilkan preview hasil mapping
+  fingertip -> koordinat layar (belum menggerakkan kursor asli - itu
+  Sprint 3).
 """
 
 import cv2
 from pynput import keyboard
 
+try:
+    import pyautogui
+    SCREEN_WIDTH, SCREEN_HEIGHT = pyautogui.size()
+except Exception:
+    # Fallback jika tidak ada display (misal environment tanpa GUI).
+    # Di laptop asli, pyautogui.size() akan berhasil.
+    SCREEN_WIDTH, SCREEN_HEIGHT = 1920, 1080
+    print("[Warning] Tidak bisa mendapatkan ukuran layar via pyautogui, "
+          f"menggunakan default {SCREEN_WIDTH}x{SCREEN_HEIGHT}.")
+
 from afk.tracker.hand_tracker import HandTracker
 from afk.tracker.face_tracker import FaceTracker
 from afk.utils.smoothing import EMASmoother
+from afk.calibration import CalibrationManager
 
 
 # ---------------------------------------------------------------------------
@@ -24,6 +38,7 @@ class AppState:
     def __init__(self):
         self.active = False  # Program mulai dalam keadaan nonaktif
         self.running = True  # Untuk keluar dari program (tombol 'q')
+        self.request_calibration = False  # diset True saat tombol 'c' ditekan
 
 state = AppState()
 
@@ -57,13 +72,15 @@ def start_hotkey_listener():
 # Overlay
 # ---------------------------------------------------------------------------
 def draw_status_overlay(frame, state: AppState, finger_status: dict | None,
-                         iris_diameter_px: float | None):
+                         iris_diameter_px: float | None,
+                         calibration_manager: CalibrationManager,
+                         mapped_screen_pos: tuple | None):
     h, w = frame.shape[:2]
 
     status_text = "AKTIF" if state.active else "NONAKTIF (Win+A untuk toggle)"
     status_color = (0, 255, 0) if state.active else (0, 0, 255)
 
-    cv2.rectangle(frame, (0, 0), (w, 95), (30, 30, 30), -1)
+    cv2.rectangle(frame, (0, 0), (w, 120), (30, 30, 30), -1)
     cv2.putText(frame, f"Status: {status_text}", (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
 
@@ -76,34 +93,95 @@ def draw_status_overlay(frame, state: AppState, finger_status: dict | None,
         )
     else:
         finger_text = "Tangan: tidak terdeteksi"
-    cv2.putText(frame, finger_text, (10, 55),
+    cv2.putText(frame, finger_text, (10, 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
     if iris_diameter_px is not None:
-        iris_text = f"Diameter iris: {iris_diameter_px:.2f} px (proxy jarak mata-kamera)"
+        iris_text = f"Diameter iris: {iris_diameter_px:.2f} px"
     else:
         iris_text = "Wajah: tidak terdeteksi"
-    cv2.putText(frame, iris_text, (10, 80),
+    cv2.putText(frame, iris_text, (10, 75),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+    if calibration_manager.is_calibrated:
+        calib_text = "Kalibrasi: SUDAH ('c' untuk ulang)"
+        calib_color = (0, 255, 0)
+    else:
+        calib_text = "Kalibrasi: BELUM (tekan 'c' untuk mulai)"
+        calib_color = (0, 165, 255)
+    cv2.putText(frame, calib_text, (10, 100),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, calib_color, 1)
+
+    if mapped_screen_pos is not None:
+        sx, sy = mapped_screen_pos
+        preview_text = f"Preview posisi layar: ({sx:.0f}, {sy:.0f}) / {calibration_manager.screen_width}x{calibration_manager.screen_height}"
+        cv2.putText(frame, preview_text, (10, h - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+
+
+def draw_calibration_overlay(frame, calibration_manager: CalibrationManager,
+                              fingertip_px: tuple | None, two_finger_gesture: bool):
+    """Overlay khusus saat mode kalibrasi aktif."""
+    h, w = frame.shape[:2]
+
+    # Banner instruksi
+    cv2.rectangle(frame, (0, h - 100), (w, h), (40, 40, 40), -1)
+
+    step_idx, total_steps = calibration_manager.progress
+    instruction = calibration_manager.current_instruction
+
+    cv2.putText(frame, f"KALIBRASI ({step_idx + 1}/{total_steps})",
+                (10, h - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    cv2.putText(frame, instruction, (10, h - 45),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    cv2.putText(frame, "Tunjukkan 2 jari (telunjuk + tengah) dan TAHAN posisi",
+                (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+    # Progress bar "hold to confirm"
+    hold_progress = calibration_manager.hold_progress
+    bar_width = int(200 * hold_progress)
+    bar_color = (0, 255, 0) if two_finger_gesture else (0, 0, 255)
+    cv2.rectangle(frame, (w - 220, h - 70), (w - 220 + 200, h - 50), (100, 100, 100), 1)
+    cv2.rectangle(frame, (w - 220, h - 70), (w - 220 + bar_width, h - 50), bar_color, -1)
+
+    if not two_finger_gesture:
+        cv2.putText(frame, "Tunjukkan gesture 2 jari!", (w - 220, h - 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+    # Tandai posisi fingertip dengan warna mencolok saat kalibrasi
+    if fingertip_px is not None:
+        color = (0, 255, 0) if two_finger_gesture else (0, 0, 255)
+        px = (int(fingertip_px[0]), int(fingertip_px[1]))
+        cv2.circle(frame, px, 12, color, 2)
+        cv2.circle(frame, px, 2, color, -1)
 
 
 def main():
     print("=" * 60)
     print("AFK - Away From Keyboard")
-    print("Sprint 1: Hand & Eye Tracking Pipeline")
+    print("Sprint 2: Kalibrasi")
     print("=" * 60)
     print("Tekan Win+A untuk toggle AKTIF/NONAKTIF")
+    print("Tekan 'c' untuk mulai/ulang kalibrasi")
     print("Tekan 'q' pada window video untuk keluar")
     print("=" * 60)
+    print(f"Resolusi layar terdeteksi: {SCREEN_WIDTH}x{SCREEN_HEIGHT}")
 
     listener = start_hotkey_listener()
 
     hand_tracker = HandTracker(max_num_hands=1)
     face_tracker = FaceTracker()
+    calibration_manager = CalibrationManager(SCREEN_WIDTH, SCREEN_HEIGHT)
 
-    # Smoother untuk posisi fingertip (telunjuk) dan diameter iris.
-    # alpha=0.5 dipilih sebagai titik awal: cukup responsif tapi sudah
-    # meredam jitter kecil. Akan di-tuning di Sprint 3.
+    # Coba load kalibrasi yang sudah ada
+    if calibration_manager.load():
+        print(f"[Kalibrasi] Berhasil memuat kalibrasi dari {calibration_manager.config_path}")
+        # Set referensi iris diameter ke FaceTracker agar distance_ratio()
+        # dari FaceTracker (jika dipakai di sprint berikutnya) konsisten
+        face_tracker.set_reference_iris_diameter(calibration_manager.data.reference_iris_diameter_px)
+    else:
+        print("[Kalibrasi] Belum ada data kalibrasi. Tekan 'c' untuk mulai kalibrasi.")
+
     index_tip_smoother = EMASmoother(alpha=0.5)
     iris_diameter_smoother = EMASmoother(alpha=0.3)
 
@@ -128,6 +206,7 @@ def main():
             hand_landmarks = hand_tracker.process(rgb_frame)
             finger_status = None
             smoothed_index_tip = None
+            two_finger_gesture = False
 
             if hand_landmarks is not None:
                 finger_status = HandTracker.count_raised_fingers(hand_landmarks)
@@ -135,11 +214,17 @@ def main():
                 raw_index_tip = HandTracker.get_index_fingertip(hand_landmarks, w, h)
                 smoothed_index_tip = index_tip_smoother.update(raw_index_tip)
 
-                # Gambar titik fingertip (telunjuk = hijau, tengah = kuning)
-                index_px = (int(smoothed_index_tip[0]), int(smoothed_index_tip[1]))
-                cv2.circle(frame, index_px, 8, (0, 255, 0), -1)
+                # Gesture 2 jari: telunjuk + tengah terangkat, jari lain tidak
+                two_finger_gesture = (
+                    finger_status["index"] and finger_status["middle"]
+                    and not finger_status["ring"] and not finger_status["pinky"]
+                )
 
+                index_px = (int(smoothed_index_tip[0]), int(smoothed_index_tip[1]))
                 middle_px = HandTracker.get_middle_fingertip(hand_landmarks, w, h)
+
+                index_color = (0, 255, 0) if two_finger_gesture else (0, 200, 0)
+                cv2.circle(frame, index_px, 8, index_color, -1)
                 cv2.circle(frame, middle_px, 6, (0, 255, 255), -1)
             else:
                 index_tip_smoother.reset()
@@ -152,21 +237,59 @@ def main():
                 raw_iris_diameter = face_tracker.iris_diameter_px(face_landmarks, w, h)
                 smoothed_iris_diameter = iris_diameter_smoother.update(raw_iris_diameter)
 
-                # Visualisasi titik iris (kiri & kanan, center saja)
-                for idx in (468, 473):  # center iris kiri & kanan
+                for idx in (468, 473):
                     px = FaceTracker.get_iris_landmark_px(face_landmarks, idx, w, h)
                     cv2.circle(frame, px, 3, (255, 0, 255), -1)
             else:
                 iris_diameter_smoother.reset()
 
-            # --- Overlay ---
-            draw_status_overlay(frame, state, finger_status, smoothed_iris_diameter)
+            # --- Trigger kalibrasi manual ---
+            if state.request_calibration and not calibration_manager.is_calibrating:
+                calibration_manager.start()
+                state.request_calibration = False
+                print("[Kalibrasi] Dimulai. Ikuti instruksi di layar.")
 
-            cv2.imshow("AFK - Sprint 1 PoC", frame)
+            # --- Proses kalibrasi jika sedang berjalan ---
+            if calibration_manager.is_calibrating:
+                confirmed = calibration_manager.update(
+                    smoothed_index_tip, smoothed_iris_diameter, two_finger_gesture
+                )
+                if confirmed:
+                    step_idx, total = calibration_manager.progress
+                    print(f"[Kalibrasi] Titik {step_idx}/{total} dikonfirmasi.")
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+                if not calibration_manager.is_calibrating and calibration_manager.is_calibrated:
+                    # Baru saja selesai kalibrasi pada frame ini
+                    calibration_manager.set_frame_size(w, h)
+                    calibration_manager.save()
+                    face_tracker.set_reference_iris_diameter(
+                        calibration_manager.data.reference_iris_diameter_px
+                    )
+                    print(f"[Kalibrasi] Selesai! Data tersimpan ke {calibration_manager.config_path}")
+                    print(f"[Kalibrasi] Data: {calibration_manager.data}")
+
+                draw_calibration_overlay(frame, calibration_manager, smoothed_index_tip, two_finger_gesture)
+
+            # --- Preview mapping ke koordinat layar (jika sudah dikalibrasi) ---
+            mapped_screen_pos = None
+            if (calibration_manager.is_calibrated and not calibration_manager.is_calibrating
+                    and smoothed_index_tip is not None):
+                mapped_screen_pos = calibration_manager.map_to_screen(
+                    smoothed_index_tip, smoothed_iris_diameter
+                )
+
+            # --- Overlay status umum (selalu ditampilkan) ---
+            draw_status_overlay(frame, state, finger_status, smoothed_iris_diameter,
+                                 calibration_manager, mapped_screen_pos)
+
+            cv2.imshow("AFK - Sprint 2 PoC", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 state.running = False
                 break
+            elif key == ord('c'):
+                state.request_calibration = True
     finally:
         cap.release()
         cv2.destroyAllWindows()

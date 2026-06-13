@@ -1,0 +1,11 @@
+# Virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Hasil kalibrasi bersifat personal per-user/device, jangan di-commit
+config/calibration.json
+
+# OS-specific
+.DS_Store
+Thumbs.db
