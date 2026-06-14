@@ -90,4 +90,4 @@ CLAUDE:
 - Klik kanan, drag, scroll — eksplorasi gesture lain (misal 3 jari = klik kanan, jari menutup-lalu-gerak = drag).
 - Sensitivitas adjustable (meski default 1:1).
 
-KITA SUDAH SAMPAI SPRINT 2 DAN TERNYATA CLAUDE KU HABIS JADI MARI KITA LANJUTKAN
+KITA SUDAH SAMPAI SPRINT 2 DAN TERNYATA CLAUDE KU HABIS JADI MARI KITA LANJUTKAN!

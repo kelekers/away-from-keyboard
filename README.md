@@ -64,10 +64,71 @@ afk_project/
 1. ✅ Setup & Riset Dasar (capture, landmark render, hotkey Win+A)
 2. ✅ Hand & Eye Tracking Pipeline (deteksi jari, estimasi jarak via iris)
 3. ✅ Kalibrasi (4 titik ekstrem layar)
-4. Cursor Control + Dynamic Re-scaling
+4. ✅ Cursor Control + Dynamic Re-scaling
 5. Gesture Klik (1 jari -> 2 jari naik = klik kiri)
 6. UX & Stabilitas (overlay, pause/resume, error handling)
 7. (Opsional) Gesture tambahan: klik kanan, drag, scroll
+
+## Sprint 3: Cursor Control + Dynamic Re-scaling
+
+Penambahan dari Sprint 2:
+
+- **`afk/cursor_controller.py`** — modul `CursorController`:
+  - Membungkus `pyautogui.moveTo()` / `pyautogui.click()`.
+  - `clamp()` — koordinat hasil mapping di-clamp ke batas layar
+    `[0, width-1] x [0, height-1]`, mencegah error/kursor "hilang" saat
+    fingertip keluar area kalibrasi.
+  - `pyautogui.FAILSAFE = False` (clamping sudah ditangani sendiri) dan
+    `pyautogui.PAUSE = 0` (tidak ada delay tambahan antar call, penting
+    untuk real-time).
+  - Mendukung `backend` opsional (lazy import pyautogui) supaya modul
+    tetap bisa di-import & di-test di environment tanpa display.
+  - **`MockCursorBackend`** — backend tiruan untuk unit test (mencatat
+    posisi & klik tanpa benar-benar menggerakkan mouse).
+
+- **`main.py`** — terintegrasi penuh:
+  - Definisi 2 gesture berdasarkan `finger_status`:
+    - **1 jari** (hanya telunjuk terangkat) -> mode **gerak kursor**.
+    - **2 jari** (telunjuk + tengah) -> dicadangkan untuk **kalibrasi**
+      (Sprint 2) dan **klik** (Sprint 4).
+  - Kursor mouse asli digerakkan via `cursor_controller.move_to()` HANYA
+    jika: `state.active == True` (toggle Win+A) **DAN** sudah dikalibrasi
+    **DAN** gesture 1 jari terdeteksi.
+  - Mapping tetap memakai `CalibrationManager.map_to_screen()` dari
+    Sprint 2 (1:1 + auto re-scaling berdasarkan jarak iris).
+  - Overlay menampilkan status "Kontrol kursor: AKTIF/nonaktif" secara
+    real-time.
+
+### Sudah Diverifikasi (unit test logic, tanpa webcam)
+- `CursorController.clamp()`: posisi normal, negatif, dan melebihi batas
+  layar — semua diclamp dengan benar.
+- `MockCursorBackend`: mencatat `move_to`/`click` dengan benar.
+- Integrasi gating logic kontrol kursor (5 skenario):
+  1. `active=False` + 1 jari -> kursor TIDAK bergerak.
+  2. `active=True` + 2 jari -> kursor TIDAK bergerak (gesture dicadangkan).
+  3. `active=True` + 1 jari -> kursor bergerak ke posisi mapping yang benar.
+  4. Fingertip di sudut kalibrasi (top-left) -> mapping ~(0,0), kursor
+     bergerak ke sana.
+  5. Fingertip di luar area kalibrasi -> mapping bernilai negatif, namun
+     `CursorController` berhasil clamp ke (0,0).
+
+### Belum diuji (perlu webcam + display asli di laptopmu)
+- Responsivitas & smoothness gerakan kursor real-time (apakah `alpha=0.5`
+  pada `index_tip_smoother` sudah pas — terlalu lag atau masih jitter).
+- Transisi antar gesture 1 jari <-> 2 jari: apakah berpindah mode terasa
+  natural atau ada "flicker" saat MediaPipe salah deteksi jari sesaat.
+- Perilaku `pyautogui.FAILSAFE = False` — pastikan tidak ada efek samping
+  saat kursor mendekati pojok layar (biasanya FAILSAFE memicu exception
+  jika kursor ke pojok kiri-atas (0,0), kita matikan ini secara sengaja).
+- Cek apakah `pyautogui.size()` mengembalikan resolusi yang benar di
+  setup multi-monitor (mungkin perlu penyesuaian jika user punya >1
+  monitor).
+
+### Catatan untuk Sprint 4 (Gesture Klik)
+- Mode "2 jari" sudah disiapkan namun belum dipakai untuk klik. Sprint 4
+  akan menambahkan deteksi gerakan **naik** dari posisi 2 jari (perubahan
+  posisi Y dalam beberapa frame) sebagai trigger klik kiri, dengan
+  cooldown/debounce untuk mencegah klik berulang tidak sengaja.
 
 ## Sprint 2: Kalibrasi
 

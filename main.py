@@ -1,15 +1,18 @@
 """
 AFK - Away From Keyboard
-Sprint 2: Kalibrasi
+Sprint 3: Cursor Control + Dynamic Re-scaling
 
-Penambahan dari Sprint 1:
-- Integrasi CalibrationManager: flow kalibrasi 4 titik (atas, bawah, kiri,
-  kanan) menggunakan gesture 2 jari (telunjuk + tengah) yang ditahan diam.
-- Load kalibrasi otomatis saat start jika file config sudah ada.
-- Tombol 'c' untuk memulai/mengulang kalibrasi secara manual.
-- Setelah kalibrasi selesai, overlay menampilkan preview hasil mapping
-  fingertip -> koordinat layar (belum menggerakkan kursor asli - itu
-  Sprint 3).
+Penambahan dari Sprint 2:
+- Integrasi CursorController: kursor mouse asli digerakkan menggunakan
+  pyautogui berdasarkan hasil map_to_screen() (1:1, dengan auto
+  re-scaling berdasarkan jarak mata-kamera dari Sprint 2).
+- Kontrol kursor HANYA aktif jika:
+    1. state.active == True (toggle via Win+A), DAN
+    2. program sudah dikalibrasi, DAN
+    3. gesture "1 jari" terdeteksi (telunjuk terangkat, jari lain
+       terlipat) - mode "2 jari" dicadangkan untuk gesture klik
+       (Sprint 4) dan kalibrasi.
+- Cursor di-clamp ke batas layar oleh CursorController.
 """
 
 import cv2
@@ -29,6 +32,7 @@ from afk.tracker.hand_tracker import HandTracker
 from afk.tracker.face_tracker import FaceTracker
 from afk.utils.smoothing import EMASmoother
 from afk.calibration import CalibrationManager
+from afk.cursor_controller import CursorController
 
 
 # ---------------------------------------------------------------------------
@@ -74,13 +78,14 @@ def start_hotkey_listener():
 def draw_status_overlay(frame, state: AppState, finger_status: dict | None,
                          iris_diameter_px: float | None,
                          calibration_manager: CalibrationManager,
-                         mapped_screen_pos: tuple | None):
+                         mapped_screen_pos: tuple | None,
+                         cursor_control_active: bool):
     h, w = frame.shape[:2]
 
     status_text = "AKTIF" if state.active else "NONAKTIF (Win+A untuk toggle)"
     status_color = (0, 255, 0) if state.active else (0, 0, 255)
 
-    cv2.rectangle(frame, (0, 0), (w, 120), (30, 30, 30), -1)
+    cv2.rectangle(frame, (0, 0), (w, 145), (30, 30, 30), -1)
     cv2.putText(frame, f"Status: {status_text}", (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
 
@@ -112,9 +117,14 @@ def draw_status_overlay(frame, state: AppState, finger_status: dict | None,
     cv2.putText(frame, calib_text, (10, 100),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, calib_color, 1)
 
+    cursor_text = "Kontrol kursor: AKTIF (mode 1 jari)" if cursor_control_active else "Kontrol kursor: nonaktif"
+    cursor_color = (0, 255, 0) if cursor_control_active else (150, 150, 150)
+    cv2.putText(frame, cursor_text, (10, 125),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, cursor_color, 1)
+
     if mapped_screen_pos is not None:
         sx, sy = mapped_screen_pos
-        preview_text = f"Preview posisi layar: ({sx:.0f}, {sy:.0f}) / {calibration_manager.screen_width}x{calibration_manager.screen_height}"
+        preview_text = f"Posisi layar: ({sx:.0f}, {sy:.0f}) / {calibration_manager.screen_width}x{calibration_manager.screen_height}"
         cv2.putText(frame, preview_text, (10, h - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
@@ -159,11 +169,12 @@ def draw_calibration_overlay(frame, calibration_manager: CalibrationManager,
 def main():
     print("=" * 60)
     print("AFK - Away From Keyboard")
-    print("Sprint 2: Kalibrasi")
+    print("Sprint 3: Cursor Control + Dynamic Re-scaling")
     print("=" * 60)
     print("Tekan Win+A untuk toggle AKTIF/NONAKTIF")
     print("Tekan 'c' untuk mulai/ulang kalibrasi")
     print("Tekan 'q' pada window video untuk keluar")
+    print("Mode kursor: tunjukkan 1 jari (telunjuk saja) untuk menggerakkan kursor")
     print("=" * 60)
     print(f"Resolusi layar terdeteksi: {SCREEN_WIDTH}x{SCREEN_HEIGHT}")
 
@@ -172,6 +183,7 @@ def main():
     hand_tracker = HandTracker(max_num_hands=1)
     face_tracker = FaceTracker()
     calibration_manager = CalibrationManager(SCREEN_WIDTH, SCREEN_HEIGHT)
+    cursor_controller = CursorController(SCREEN_WIDTH, SCREEN_HEIGHT)
 
     # Coba load kalibrasi yang sudah ada
     if calibration_manager.load():
@@ -207,6 +219,7 @@ def main():
             finger_status = None
             smoothed_index_tip = None
             two_finger_gesture = False
+            one_finger_gesture = False
 
             if hand_landmarks is not None:
                 finger_status = HandTracker.count_raised_fingers(hand_landmarks)
@@ -215,15 +228,23 @@ def main():
                 smoothed_index_tip = index_tip_smoother.update(raw_index_tip)
 
                 # Gesture 2 jari: telunjuk + tengah terangkat, jari lain tidak
+                # Dipakai untuk kalibrasi (Sprint 2) dan klik (Sprint 4).
                 two_finger_gesture = (
                     finger_status["index"] and finger_status["middle"]
+                    and not finger_status["ring"] and not finger_status["pinky"]
+                )
+
+                # Gesture 1 jari: hanya telunjuk terangkat. Dipakai untuk
+                # menggerakkan kursor (Sprint 3).
+                one_finger_gesture = (
+                    finger_status["index"] and not finger_status["middle"]
                     and not finger_status["ring"] and not finger_status["pinky"]
                 )
 
                 index_px = (int(smoothed_index_tip[0]), int(smoothed_index_tip[1]))
                 middle_px = HandTracker.get_middle_fingertip(hand_landmarks, w, h)
 
-                index_color = (0, 255, 0) if two_finger_gesture else (0, 200, 0)
+                index_color = (0, 255, 0) if (one_finger_gesture or two_finger_gesture) else (0, 200, 0)
                 cv2.circle(frame, index_px, 8, index_color, -1)
                 cv2.circle(frame, middle_px, 6, (0, 255, 255), -1)
             else:
@@ -270,19 +291,28 @@ def main():
 
                 draw_calibration_overlay(frame, calibration_manager, smoothed_index_tip, two_finger_gesture)
 
-            # --- Preview mapping ke koordinat layar (jika sudah dikalibrasi) ---
+            # --- Mapping ke koordinat layar & gerakkan kursor (jika sudah dikalibrasi) ---
             mapped_screen_pos = None
+            cursor_control_active = False
+
             if (calibration_manager.is_calibrated and not calibration_manager.is_calibrating
                     and smoothed_index_tip is not None):
                 mapped_screen_pos = calibration_manager.map_to_screen(
                     smoothed_index_tip, smoothed_iris_diameter
                 )
 
+                # Kontrol kursor hanya jika: program aktif (Win+A) DAN
+                # gesture 1 jari terdeteksi (mode gerak kursor, bukan klik).
+                cursor_control_active = state.active and one_finger_gesture
+
+                if cursor_control_active:
+                    cursor_controller.move_to(*mapped_screen_pos)
+
             # --- Overlay status umum (selalu ditampilkan) ---
             draw_status_overlay(frame, state, finger_status, smoothed_iris_diameter,
-                                 calibration_manager, mapped_screen_pos)
+                                 calibration_manager, mapped_screen_pos, cursor_control_active)
 
-            cv2.imshow("AFK - Sprint 2 PoC", frame)
+            cv2.imshow("AFK - Sprint 3 PoC", frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
