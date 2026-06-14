@@ -65,9 +65,77 @@ afk_project/
 2. ✅ Hand & Eye Tracking Pipeline (deteksi jari, estimasi jarak via iris)
 3. ✅ Kalibrasi (4 titik ekstrem layar)
 4. ✅ Cursor Control + Dynamic Re-scaling
-5. Gesture Klik (1 jari -> 2 jari naik = klik kiri)
+5. ✅ Gesture Klik (1 jari -> 2 jari naik = klik kiri)
 6. UX & Stabilitas (overlay, pause/resume, error handling)
 7. (Opsional) Gesture tambahan: klik kanan, drag, scroll
+
+## Sprint 4: Gesture Klik
+
+Penambahan dari Sprint 3:
+
+- **`afk/click_gesture.py`** — modul `ClickGestureDetector`:
+  - **Velocity-based detection**: setiap frame saat gesture 2 jari
+    (telunjuk + tengah) aktif, dihitung `velocity = prev_y - current_y`
+    dari posisi Y **mentah** (tidak smoothed) jari tengah. Velocity
+    positif = bergerak ke atas.
+  - Klik ter-trigger jika `velocity >= UP_VELOCITY_THRESHOLD_PX_PER_FRAME`
+    (default **18 px/frame**, ~540px/detik @30fps) — ini secara natural
+    membedakan **sentilan cepat** (trigger) dari **drift lambat** saat
+    reposisi tangan (tidak trigger), tanpa perlu jendela waktu/baseline
+    yang rumit.
+  - **Cooldown 15 frame** (~0.5 detik @30fps) setelah klik ter-trigger,
+    mencegah klik berulang dari satu gesture yang sama.
+  - `reset()` dipanggil saat gesture 2 jari hilang — mencegah lompatan
+    velocity palsu saat gesture dimulai kembali dari posisi berbeda.
+    Cooldown TIDAK direset agar user tidak bisa "spam" klik dengan
+    melepas-pasang gesture cepat.
+
+- **`main.py`** — terintegrasi:
+  - Posisi Y mentah jari tengah (`raw_middle_y`, bukan hasil EMA)
+    diteruskan ke `ClickGestureDetector` — smoothing akan meredam
+    velocity dan membuat sentilan cepat sulit terdeteksi.
+  - Klik hanya diproses jika `state.active == True` (toggle Win+A).
+  - Saat klik ter-trigger: kursor di-`clamp()` & di-`move_to()` ke
+    posisi mapping terakhir (dari jari telunjuk) **sebelum** memanggil
+    `cursor_controller.click("left")` — memastikan klik terjadi tepat
+    di posisi yang ditunjuk, bukan di posisi jari tengah.
+  - Overlay menampilkan indikator visual besar "KLIK!" saat trigger
+    terjadi.
+
+### Sudah Diverifikasi (unit test logic, tanpa webcam)
+- Drift lambat (5px/frame) selama 20 frame -> **TIDAK** trigger klik.
+- Sentilan cepat (25px dalam 1 frame, velocity=25 >= 18) -> **trigger**.
+- Cooldown: sentilan kedua langsung setelah klik pertama -> **tidak**
+  trigger; setelah 15 frame cooldown selesai, sentilan berikutnya
+  -> trigger lagi.
+- Gerakan ke BAWAH (velocity negatif) -> tidak trigger.
+- Gesture 2 jari hilang lalu muncul lagi di posisi jauh -> tidak
+  menghasilkan velocity palsu (prev_y di-reset).
+- Integration test penuh: 1 jari gerak kursor ke (960,540) -> ganti ke
+  2 jari (baseline) -> sentil ke atas -> `click("left")` terpanggil di
+  posisi (960,540) yang benar.
+- Klik ditekan saat `state.active == False` -> tidak ada klik
+  ter-trigger sama sekali.
+
+### Belum diuji (perlu webcam asli di laptopmu)
+- **Tuning `UP_VELOCITY_THRESHOLD_PX_PER_FRAME=18`** — ini sangat
+  bergantung pada FPS aktual webcam & resolusi. Jika terlalu sensitif
+  (klik tidak sengaja saat reposisi cepat) turunkan threshold; jika
+  sulit ter-trigger, naikkan atau perbesar threshold velocity.
+- **Tuning `COOLDOWN_FRAMES=15`** — apakah 0.5 detik @30fps terasa pas
+  untuk klik berurutan (misal double-click manual).
+- Apakah gerakan "menyentil jari tengah ke atas" terasa natural/nyaman
+  dilakukan berulang kali.
+- Interaksi antara mode 1 jari (gerak kursor) dan 2 jari (klik) — pastikan
+  transisi tidak menyebabkan kursor "melompat" tiba-tiba saat jari tengah
+  diangkat (karena mapping tetap dari jari telunjuk, seharusnya aman, tapi
+  perlu verifikasi visual).
+
+### Catatan untuk Sprint 5 (UX & Stabilitas)
+- Saat ini overlay sudah menampilkan banyak info debug. Sprint 5 akan
+  mempertimbangkan mode "minimal overlay" untuk penggunaan sehari-hari,
+  plus gesture pause/resume dan error handling (tangan/wajah hilang dari
+  frame, dll).
 
 ## Sprint 3: Cursor Control + Dynamic Re-scaling
 

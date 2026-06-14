@@ -1,18 +1,16 @@
 """
 AFK - Away From Keyboard
-Sprint 3: Cursor Control + Dynamic Re-scaling
+Sprint 4: Gesture Klik
 
-Penambahan dari Sprint 2:
-- Integrasi CursorController: kursor mouse asli digerakkan menggunakan
-  pyautogui berdasarkan hasil map_to_screen() (1:1, dengan auto
-  re-scaling berdasarkan jarak mata-kamera dari Sprint 2).
-- Kontrol kursor HANYA aktif jika:
-    1. state.active == True (toggle via Win+A), DAN
-    2. program sudah dikalibrasi, DAN
-    3. gesture "1 jari" terdeteksi (telunjuk terangkat, jari lain
-       terlipat) - mode "2 jari" dicadangkan untuk gesture klik
-       (Sprint 4) dan kalibrasi.
-- Cursor di-clamp ke batas layar oleh CursorController.
+Penambahan dari Sprint 3:
+- Integrasi ClickGestureDetector: saat gesture 2 jari (telunjuk + tengah)
+  aktif, gerakan CEPAT ke atas dari jari tengah (velocity-based) memicu
+  klik kiri via CursorController.click("left").
+- Klik di-trigger pada posisi kursor TERAKHIR (hasil mapping dari jari
+  telunjuk), bukan posisi jari tengah - sehingga klik terjadi tepat di
+  lokasi yang sedang ditunjuk.
+- Cooldown/debounce mencegah klik berulang dari satu gesture yang sama.
+- Overlay menampilkan indikator visual saat klik ter-trigger.
 """
 
 import cv2
@@ -33,6 +31,7 @@ from afk.tracker.face_tracker import FaceTracker
 from afk.utils.smoothing import EMASmoother
 from afk.calibration import CalibrationManager
 from afk.cursor_controller import CursorController
+from afk.click_gesture import ClickGestureDetector
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +78,8 @@ def draw_status_overlay(frame, state: AppState, finger_status: dict | None,
                          iris_diameter_px: float | None,
                          calibration_manager: CalibrationManager,
                          mapped_screen_pos: tuple | None,
-                         cursor_control_active: bool):
+                         cursor_control_active: bool,
+                         click_triggered: bool):
     h, w = frame.shape[:2]
 
     status_text = "AKTIF" if state.active else "NONAKTIF (Win+A untuk toggle)"
@@ -128,6 +128,12 @@ def draw_status_overlay(frame, state: AppState, finger_status: dict | None,
         cv2.putText(frame, preview_text, (10, h - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
+    # Indikator visual besar saat klik ter-trigger
+    if click_triggered:
+        cv2.putText(frame, "KLIK!", (w // 2 - 60, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 255), 4)
+        cv2.circle(frame, (w // 2, h // 2 + 50), 20, (0, 0, 255), -1)
+
 
 def draw_calibration_overlay(frame, calibration_manager: CalibrationManager,
                               fingertip_px: tuple | None, two_finger_gesture: bool):
@@ -169,12 +175,13 @@ def draw_calibration_overlay(frame, calibration_manager: CalibrationManager,
 def main():
     print("=" * 60)
     print("AFK - Away From Keyboard")
-    print("Sprint 3: Cursor Control + Dynamic Re-scaling")
+    print("Sprint 4: Gesture Klik")
     print("=" * 60)
     print("Tekan Win+A untuk toggle AKTIF/NONAKTIF")
     print("Tekan 'c' untuk mulai/ulang kalibrasi")
     print("Tekan 'q' pada window video untuk keluar")
-    print("Mode kursor: tunjukkan 1 jari (telunjuk saja) untuk menggerakkan kursor")
+    print("Mode kursor : 1 jari (telunjuk saja) untuk menggerakkan kursor")
+    print("Mode klik   : 2 jari (telunjuk+tengah), lalu sentil jari tengah ke ATAS")
     print("=" * 60)
     print(f"Resolusi layar terdeteksi: {SCREEN_WIDTH}x{SCREEN_HEIGHT}")
 
@@ -184,6 +191,7 @@ def main():
     face_tracker = FaceTracker()
     calibration_manager = CalibrationManager(SCREEN_WIDTH, SCREEN_HEIGHT)
     cursor_controller = CursorController(SCREEN_WIDTH, SCREEN_HEIGHT)
+    click_detector = ClickGestureDetector()
 
     # Coba load kalibrasi yang sudah ada
     if calibration_manager.load():
@@ -220,6 +228,7 @@ def main():
             smoothed_index_tip = None
             two_finger_gesture = False
             one_finger_gesture = False
+            raw_middle_y = None
 
             if hand_landmarks is not None:
                 finger_status = HandTracker.count_raised_fingers(hand_landmarks)
@@ -243,6 +252,7 @@ def main():
 
                 index_px = (int(smoothed_index_tip[0]), int(smoothed_index_tip[1]))
                 middle_px = HandTracker.get_middle_fingertip(hand_landmarks, w, h)
+                raw_middle_y = middle_px[1]  # posisi Y mentah (tidak smoothed) untuk click detector
 
                 index_color = (0, 255, 0) if (one_finger_gesture or two_finger_gesture) else (0, 200, 0)
                 cv2.circle(frame, index_px, 8, index_color, -1)
@@ -294,6 +304,7 @@ def main():
             # --- Mapping ke koordinat layar & gerakkan kursor (jika sudah dikalibrasi) ---
             mapped_screen_pos = None
             cursor_control_active = False
+            click_triggered = False
 
             if (calibration_manager.is_calibrated and not calibration_manager.is_calibrating
                     and smoothed_index_tip is not None):
@@ -308,11 +319,28 @@ def main():
                 if cursor_control_active:
                     cursor_controller.move_to(*mapped_screen_pos)
 
+                # --- Deteksi gesture klik (gerakan cepat ke atas jari tengah) ---
+                # Hanya aktif jika program aktif (Win+A). Klik di-trigger pada
+                # posisi kursor saat ini (mapped_screen_pos dari jari telunjuk),
+                # bukan posisi jari tengah.
+                if state.active:
+                    click_triggered = click_detector.update(two_finger_gesture, raw_middle_y)
+                    if click_triggered:
+                        cx, cy = cursor_controller.clamp(*mapped_screen_pos)
+                        cursor_controller.move_to(cx, cy)  # pastikan kursor di posisi yang benar sebelum klik
+                        cursor_controller.click("left")
+                        print(f"[Klik] Klik kiri di ({cx}, {cy})")
+                else:
+                    click_detector.reset()
+            else:
+                click_detector.reset()
+
             # --- Overlay status umum (selalu ditampilkan) ---
             draw_status_overlay(frame, state, finger_status, smoothed_iris_diameter,
-                                 calibration_manager, mapped_screen_pos, cursor_control_active)
+                                 calibration_manager, mapped_screen_pos, cursor_control_active,
+                                 click_triggered)
 
-            cv2.imshow("AFK - Sprint 3 PoC", frame)
+            cv2.imshow("AFK - Sprint 4 PoC", frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
